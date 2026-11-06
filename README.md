@@ -3,6 +3,9 @@
 UDP obfuscation, TCP Scrambler and legacy WebSocket-over-TLS (WSS) patches for
 OpenVPN **2.7.9**. The OpenSSL backend is required.
 
+Need a prebuilt client? A ready-to-use build is available at
+[here](https://github.com/aw3r1se/ovpn-obfuscate).
+
 ## Apply patches
 
 ### Windows
