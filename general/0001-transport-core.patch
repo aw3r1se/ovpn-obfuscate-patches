@@ -1,0 +1,889 @@
+Subject: [PATCH] Add common infrastructure for optional transports
+
+Base: OpenVPN v2.7.9 (7b60c2a)
+---
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c92d9ea..f63a3fc 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -35,6 +35,14 @@ option(MBED "BUILD with mbed" OFF)
+ set(MBED_INCLUDE_PATH "" CACHE STRING "Path to mbed TLS include directory")
+ set(MBED_LIBRARY_PATH "" CACHE STRING "Path to mbed library directory")
+ option(WOLFSSL "BUILD with wolfSSL" OFF)
++
++if(MBED OR WOLFSSL)
++    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/openvpn/obfs_udp.c"
++       OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/openvpn/obfs_tcp.c"
++       OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/openvpn/wss_client.c")
++        message(FATAL_ERROR "Transport obfuscation modules require the OpenSSL backend")
++    endif()
++endif()
+ option(ENABLE_LZ4 "BUILD with lz4" ON)
+ option(ENABLE_LZO "BUILD with lzo" ON)
+ option(ENABLE_PKCS11 "BUILD with pkcs11-helper" ON)
+@@ -623,6 +631,39 @@ set(SOURCE_FILES
+ 
+ add_executable(openvpn ${SOURCE_FILES})
+ 
++# Only compile transport implementations present in this source tree.
++set(OBFS_SOURCES_udp
++    src/openvpn/obfs_udp.c
++    src/openvpn/obfs_udp.h
++)
++set(OBFS_SOURCES_tcp
++    src/openvpn/obfs_tcp.c
++    src/openvpn/obfs_tcp.h
++)
++set(OBFS_SOURCES_wss
++    src/openvpn/wss_client.c
++    src/openvpn/wss_client.h
++    src/openvpn/wss_frame.c
++    src/openvpn/wss_frame.h
++)
++foreach(feature udp tcp wss)
++    list(GET OBFS_SOURCES_${feature} 0 marker)
++    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${marker}")
++        foreach(source IN LISTS OBFS_SOURCES_${feature})
++            if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
++                message(FATAL_ERROR "Incomplete ${feature} module: ${source}")
++            endif()
++        endforeach()
++        string(TOUPPER "${feature}" feature_upper)
++        add_compile_definitions(OBFS_ENABLE_${feature_upper}=1)
++        target_sources(openvpn PRIVATE ${OBFS_SOURCES_${feature}})
++        list(APPEND OBFS_UNIT_TESTS test_obfs_${feature})
++        set(OBFS_TEST_SOURCES_${feature} ${OBFS_SOURCES_${feature}})
++        list(FILTER OBFS_TEST_SOURCES_${feature} INCLUDE REGEX "[.]c$")
++        list(REMOVE_ITEM OBFS_TEST_SOURCES_${feature} src/openvpn/wss_client.c)
++    endif()
++endforeach()
++
+ add_library_deps(openvpn)
+ 
+ target_compile_options(openvpn PRIVATE -DDEFAULT_DNS_UPDOWN=\"${DNS_UPDOWN_PATH}\")
+@@ -675,6 +716,8 @@ if (BUILD_TESTING)
+         "test_push_update_msg"
+         )
+ 
++    list(APPEND unit_tests ${OBFS_UNIT_TESTS})
++
+     if (WIN32)
+         list(APPEND unit_tests
+             "test_cryptoapi"
+@@ -879,6 +922,14 @@ if (BUILD_TESTING)
+         src/openvpn/base64.c
+         )
+ 
++    foreach(feature udp tcp wss)
++        if(TARGET test_obfs_${feature})
++            target_sources(test_obfs_${feature} PRIVATE
++                tests/unit_tests/openvpn/mock_get_random.c
++                src/openvpn/buffer.c ${OBFS_TEST_SOURCES_${feature}})
++        endif()
++    endforeach()
++
+     target_link_libraries(test_socket PUBLIC ${RESOLV_LIBRARIES})
+     target_sources(test_socket PRIVATE
+         tests/unit_tests/openvpn/mock_get_random.c
+diff --git a/configure.ac b/configure.ac
+index f427835..7e9b7bb 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -1413,4 +1413,34 @@ AC_CONFIG_FILES([
+ 	sample/Makefile
+ ])
+ AC_CONFIG_FILES([tests/t_client.sh], [chmod +x tests/t_client.sh])
++# Feature patches add independent transport source files.
++AM_CONDITIONAL([HAVE_OBFS_UDP], [test -f "$srcdir/src/openvpn/obfs_udp.c"])
++AS_IF([test -f "$srcdir/src/openvpn/obfs_udp.c"], [
++    AS_IF([test "x$with_crypto_library" != xopenssl],
++          [AC_MSG_ERROR([Transport obfuscation modules require the OpenSSL backend])])
++    AS_IF([test ! -f "$srcdir/src/openvpn/obfs_udp.h"],
++          [AC_MSG_ERROR([Incomplete udp module: obfs_udp.h])])
++    AC_DEFINE([OBFS_ENABLE_UDP], [1], [Build the UDP transport])
++])
++AM_CONDITIONAL([HAVE_OBFS_TCP], [test -f "$srcdir/src/openvpn/obfs_tcp.c"])
++AS_IF([test -f "$srcdir/src/openvpn/obfs_tcp.c"], [
++    AS_IF([test "x$with_crypto_library" != xopenssl],
++          [AC_MSG_ERROR([Transport obfuscation modules require the OpenSSL backend])])
++    AS_IF([test ! -f "$srcdir/src/openvpn/obfs_tcp.h"],
++          [AC_MSG_ERROR([Incomplete tcp module: obfs_tcp.h])])
++    AC_DEFINE([OBFS_ENABLE_TCP], [1], [Build the TCP transport])
++])
++AM_CONDITIONAL([HAVE_OBFS_WSS], [test -f "$srcdir/src/openvpn/wss_client.c"])
++AS_IF([test -f "$srcdir/src/openvpn/wss_client.c"], [
++    AS_IF([test "x$with_crypto_library" != xopenssl],
++          [AC_MSG_ERROR([Transport obfuscation modules require the OpenSSL backend])])
++    AS_IF([test ! -f "$srcdir/src/openvpn/wss_client.h"],
++          [AC_MSG_ERROR([Incomplete wss module: wss_client.h])])
++    AS_IF([test ! -f "$srcdir/src/openvpn/wss_frame.c"],
++          [AC_MSG_ERROR([Incomplete wss module: wss_frame.c])])
++    AS_IF([test ! -f "$srcdir/src/openvpn/wss_frame.h"],
++          [AC_MSG_ERROR([Incomplete wss module: wss_frame.h])])
++    AC_DEFINE([OBFS_ENABLE_WSS], [1], [Build the WSS transport])
++])
++
+ AC_OUTPUT
+diff --git a/src/openvpn/Makefile.am b/src/openvpn/Makefile.am
+index 27d1105..9676282 100644
+--- a/src/openvpn/Makefile.am
++++ b/src/openvpn/Makefile.am
+@@ -170,3 +170,19 @@ if WIN32
+ openvpn_SOURCES += openvpn_win32_resources.rc wfp_block.c wfp_block.h
+ openvpn_LDADD += -lgdi32 -lws2_32 -lwininet -lcrypt32 -liphlpapi -lwinmm -lfwpuclnt -lrpcrt4 -lncrypt -lsetupapi -lbcrypt
+ endif
++
++# configure detects installed optional transport implementations.
++openvpn_SOURCES += obfs_features.h
++nodist_openvpn_SOURCES =
++if HAVE_OBFS_UDP
++nodist_openvpn_SOURCES += obfs_udp.c obfs_udp.h
++EXTRA_DIST += obfs_udp.c obfs_udp.h
++endif
++if HAVE_OBFS_TCP
++nodist_openvpn_SOURCES += obfs_tcp.c obfs_tcp.h
++EXTRA_DIST += obfs_tcp.c obfs_tcp.h
++endif
++if HAVE_OBFS_WSS
++nodist_openvpn_SOURCES += wss_client.c wss_client.h wss_frame.c wss_frame.h
++EXTRA_DIST += wss_client.c wss_client.h wss_frame.c wss_frame.h
++endif
+diff --git a/src/openvpn/dco.c b/src/openvpn/dco.c
+index 88b1838..94b4072 100644
+--- a/src/openvpn/dco.c
++++ b/src/openvpn/dco.c
+@@ -312,6 +312,13 @@ dco_check_option_ce(const struct connection_entry *ce, msglvl_t msglevel, int mo
+ bool
+ dco_check_startup_option(msglvl_t msglevel, const struct options *o)
+ {
++    if (o->obfs_tcp_key || o->obfs_udp_key || o->wss_host)
++    {
++        msg(msglevel, "Note: transport obfuscation requires userspace packet processing, "
++                      "disabling data channel offload.");
++        return false;
++    }
++
+     /* check if no dev name was specified at all. In the case,
+      * later logic will most likely stop OpenVPN, so no need to
+      * print any message here.
+diff --git a/src/openvpn/forward.c b/src/openvpn/forward.c
+index c1330b4..d031f65 100644
+--- a/src/openvpn/forward.c
++++ b/src/openvpn/forward.c
+@@ -22,6 +22,7 @@
+ 
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
++#include "obfs_features.h"
+ #endif
+ 
+ #include "syshead.h"
+@@ -42,9 +43,31 @@
+ #include "dco.h"
+ #include "auth_token.h"
+ #include "tun_afunix.h"
++#if OBFS_ENABLE_UDP
++#include "obfs_udp.h"
++#endif
++#if OBFS_ENABLE_TCP
++#include "obfs_tcp.h"
++#endif
+ 
+ #include "memdbg.h"
+ 
++#if OBFS_ENABLE_WSS
++static bool
++sockets_wss_wants_write(const struct context *c)
++{
++    for (int i = 0; i < c->c1.link_sockets_num; ++i)
++    {
++        const struct link_socket *sock = c->c2.link_sockets[i];
++        if (sock && sock->wss && obfs_wss_wants_write(sock))
++        {
++            return true;
++        }
++    }
++    return false;
++}
++#endif
++
+ counter_type link_read_bytes_global;  /* GLOBAL */
+ counter_type link_write_bytes_global; /* GLOBAL */
+ 
+@@ -941,6 +964,23 @@ link_socket_write_post_size_adjust(int *size, int size_delta, struct buffer *buf
+     }
+ }
+ 
++#if OBFS_ENABLE_UDP
++/*
++ * Lazily create the UDP obfuscation context for this link socket.  The socket
++ * is shared by all instances in server mode, so a single context serves the
++ * read path (top context) and every per-instance write path.
++ */
++static void
++link_socket_obfs_init(struct context *c, struct link_socket *sock)
++{
++    if (!sock->obfs_init_done)
++    {
++        sock->obfs_init_done = true;
++        sock->obfs = obfs_udp_init(c->options.obfs_udp_key, c->options.obfs_udp_padding);
++    }
++}
++
++#endif
+ /*
+  * Output: c->c2.buf
+  */
+@@ -1004,6 +1044,28 @@ read_incoming_link(struct context *c, struct link_socket *sock)
+ 
+     /* Remove socks header if applicable */
+     socks_postprocess_incoming_link(c, sock);
++
++#if OBFS_ENABLE_TCP
++    if (sock->obfs_tcp && c->c2.buf.len > 0
++        && !obfs_tcp_decode(sock->obfs_tcp, &c->c2.buf))
++    {
++        c->c2.buf.len = 0;
++        register_signal(c->sig, SIGUSR1, "obfs-tcp-decode-failed");
++    }
++#endif
++
++    /* Reverse UDP obfuscation (--obfuscate-udp) before the packet is processed */
++#if OBFS_ENABLE_UDP
++    if (c->options.obfs_udp_key && c->c2.buf.len > 0 && proto_is_udp(sock->info.proto))
++    {
++        link_socket_obfs_init(c, sock);
++        if (!sock->obfs || !obfs_udp_deobfuscate(sock->obfs, &c->c2.buf))
++        {
++            msg(D_LINK_ERRORS, "OBFS: deobfuscate failed, dropping packet");
++            c->c2.buf.len = 0; /* treat as an empty read so the packet is dropped */
++        }
++    }
++#endif
+ }
+ 
+ bool
+@@ -1773,6 +1835,24 @@ process_outgoing_link(struct context *c, struct link_socket *sock)
+     struct gc_arena gc = gc_new();
+     int error_code = 0;
+ 
++#if OBFS_ENABLE_WSS
++    /*
++     * Flush TLS output left over from a previous partial write.  Only take the
++     * shortcut while there is nothing else to send: a pending to_link must go
++     * through the normal path below, otherwise it stays queued for another loop
++     * iteration and a failing flush would silently drop it.
++     */
++    if (sock->wss && c->c2.to_link.len <= 0 && obfs_wss_wants_write(sock))
++    {
++        if (!obfs_wss_flush(sock))
++        {
++            register_signal(c->sig, SIGUSR1, "wss-write-failed");
++        }
++        gc_free(&gc);
++        return;
++    }
++#endif
++
+     if (c->c2.to_link.len > 0 && c->c2.to_link.len <= c->c2.frame.buf.payload_size)
+     {
+         /*
+@@ -1782,6 +1862,31 @@ process_outgoing_link(struct context *c, struct link_socket *sock)
+         int size = 0;
+         ASSERT(link_socket_actual_defined(c->c2.to_link_addr));
+ 
++#if OBFS_ENABLE_TCP
++        if (sock->obfs_tcp && !obfs_tcp_encode(sock->obfs_tcp, &c->c2.to_link))
++        {
++            register_signal(c->sig, SIGUSR1, "obfs-tcp-encode-failed");
++            buf_reset(&c->c2.to_link);
++            gc_free(&gc);
++            return;
++        }
++#endif
++
++        /* Apply UDP obfuscation (--obfuscate-udp) just before hitting the wire */
++#if OBFS_ENABLE_UDP
++        if (c->options.obfs_udp_key && proto_is_udp(sock->info.proto))
++        {
++            link_socket_obfs_init(c, sock);
++            if (!sock->obfs || !obfs_udp_obfuscate(sock->obfs, &c->c2.to_link))
++            {
++                msg(D_LINK_ERRORS, "OBFS: obfuscate failed, dropping packet");
++                buf_reset(&c->c2.to_link);
++                gc_free(&gc);
++                return;
++            }
++        }
++#endif
++
+ #ifdef ENABLE_DEBUG
+         /* In gremlin-test mode, we may choose to drop this packet */
+         if (!c->options.gremlin || ask_gremlin(c->options.gremlin))
+@@ -1848,6 +1953,10 @@ process_outgoing_link(struct context *c, struct link_socket *sock)
+         /* Check return status */
+         error_code = openvpn_errno();
+         check_status(size, "write", sock, NULL);
++        if (size < 0 && (sock->obfs_tcp || sock->wss))
++        {
++            register_signal(c->sig, SIGUSR1, "obfs-transport-write-failed");
++        }
+ 
+         if (size > 0)
+         {
+@@ -2058,6 +2167,10 @@ multi_io_process_flags(struct context *c, struct event_set *es, struct link_sock
+ {
+     unsigned int socket = 0;
+     unsigned int tuntap = 0;
++    bool transport_output = false;
++#if OBFS_ENABLE_WSS
++    transport_output = sockets_wss_wants_write(c);
++#endif
+     static uintptr_t tun_shift = TUN_SHIFT;
+     static uintptr_t err_shift = ERR_SHIFT;
+ 
+@@ -2069,7 +2182,7 @@ multi_io_process_flags(struct context *c, struct event_set *es, struct link_sock
+         wait_signal(es, (void *)err_shift);
+     }
+ 
+-    if (flags & IOW_TO_LINK)
++    if ((flags & IOW_TO_LINK) || transport_output)
+     {
+         if (flags & IOW_SHAPER)
+         {
+diff --git a/src/openvpn/init.c b/src/openvpn/init.c
+index e88327f..09f3a4c 100644
+--- a/src/openvpn/init.c
++++ b/src/openvpn/init.c
+@@ -22,6 +22,7 @@
+ 
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
++#include "obfs_features.h"
+ #endif
+ 
+ #include "syshead.h"
+@@ -2959,7 +2960,22 @@ frame_finalize_options(struct context *c, const struct options *o)
+     tailroom += COMP_EXTRA_BUFFER(payload_size);
+ #endif
+ 
++    /* UDP obfuscation appends up to obfs_udp_padding bytes after the packet */
++#if OBFS_ENABLE_UDP
++    if (o->obfs_udp_key)
++    {
++        tailroom += o->obfs_udp_padding;
++    }
++#endif
++
+     frame->buf.payload_size = payload_size;
++#if OBFS_ENABLE_WSS
++    if (o->wss_host)
++    {
++        /* TLS records and the masked WebSocket header share the socket buffers. */
++        tailroom += 4096;
++    }
++#endif
+     frame->buf.headroom = headroom;
+     frame->buf.tailroom = tailroom;
+ }
+diff --git a/src/openvpn/obfs_features.h b/src/openvpn/obfs_features.h
+new file mode 100644
+index 0000000..233d73d
+--- /dev/null
++++ b/src/openvpn/obfs_features.h
+@@ -0,0 +1,13 @@
++/* Build systems define installed transports; absent modules default to off. */
++#ifndef OBFS_FEATURES_H
++#define OBFS_FEATURES_H
++#ifndef OBFS_ENABLE_UDP
++#define OBFS_ENABLE_UDP 0
++#endif
++#ifndef OBFS_ENABLE_TCP
++#define OBFS_ENABLE_TCP 0
++#endif
++#ifndef OBFS_ENABLE_WSS
++#define OBFS_ENABLE_WSS 0
++#endif
++#endif
+diff --git a/src/openvpn/options.c b/src/openvpn/options.c
+index c137599..c44048e 100644
+--- a/src/openvpn/options.c
++++ b/src/openvpn/options.c
+@@ -28,6 +28,7 @@
+ 
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
++#include "obfs_features.h"
+ #endif
+ #ifdef HAVE_CONFIG_VERSION_H
+ #include "config-version.h"
+@@ -44,6 +45,9 @@
+ #include "ssl.h"
+ #include "ssl_ncp.h"
+ #include "options.h"
++#if OBFS_ENABLE_UDP
++#include "obfs_udp.h"
++#endif
+ #include "misc.h"
+ #include "socket_util.h"
+ #include "packet_id.h"
+@@ -199,6 +203,24 @@ static const char usage_message[] =
+     "                  /dev/net/tun, /dev/tun, /dev/tap, etc.\n"
+ #if defined(ENABLE_DCO)
+     "--disable-dco   : Do not attempt using Data Channel Offload.\n"
++#endif
++#if OBFS_ENABLE_TCP
++    "--obfuscate key : client TCP Scrambler (experimental).\n"
++#endif
++#if OBFS_ENABLE_UDP
++    "--obfuscate-udp key padding : UDP obfuscation.\n"
++#endif
++#if OBFS_ENABLE_WSS
++    "--wss-proxy host uri : Legacy WebSocket-over-TLS client.\n"
++#endif
++#if OBFS_ENABLE_WSS
++    "--wss-proxy-sni [name] : Enable SNI for the outer TLS connection.\n"
++#endif
++#if OBFS_ENABLE_WSS
++    "--wss-proxy-allow-self-signed-cert : Skip outer TLS certificate verification.\n"
++#endif
++#if OBFS_ENABLE_WSS
++    "--wss-proxy-header name [value] : Override/add an HTTP Upgrade header.\n"
+ #endif
+     "--lladdr hw     : Set the link layer address of the tap device.\n"
+     "--topology t    : Set --dev tun topology: 'net30', 'p2p', or 'subnet'.\n"
+@@ -6581,6 +6603,89 @@ add_option(struct options *options, char *p[], bool is_inline, const char *file,
+             goto err;
+         }
+     }
++#if OBFS_ENABLE_TCP
++    else if (streq(p[0], "obfuscate") && p[1] && !p[2])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++        if (!*p[1] || strlen(p[1]) > 4096)
++        {
++            msg(msglevel, "obfuscate: key length must be 1..4096 characters");
++            goto err;
++        }
++        options->obfs_tcp_key = p[1];
++    }
++#endif
++#if OBFS_ENABLE_WSS
++    else if (streq(p[0], "wss-proxy") && p[1] && !p[3])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++        if (!*p[1] || strlen(p[1]) > 255 || strchr(p[1], '/')
++            || strpbrk(p[1], "\r\n") || (p[2] && (p[2][0] != '/' || strlen(p[2]) > 2048
++                                                   || strpbrk(p[2], "\r\n "))))
++        {
++            msg(msglevel, "wss-proxy: invalid Host or URI");
++            goto err;
++        }
++        options->wss_host = p[1];
++        options->wss_uri = p[2] ? p[2] : "/";
++    }
++#endif
++#if OBFS_ENABLE_WSS
++    else if (streq(p[0], "wss-proxy-sni") && !p[2])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++        options->wss_sni_enabled = true;
++        options->wss_sni = p[1];
++    }
++#endif
++#if OBFS_ENABLE_WSS
++    else if (streq(p[0], "wss-proxy-allow-self-signed-cert") && !p[1])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++        options->wss_allow_self_signed = true;
++    }
++#endif
++#if OBFS_ENABLE_WSS
++    else if (streq(p[0], "wss-proxy-header") && p[1] && !p[3])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++        if (options->wss_header_count >= 20 || !*p[1] || strlen(p[1]) > 128
++            || strpbrk(p[1], ":\r\n ") || (p[2] && (strlen(p[2]) > 1024 || strpbrk(p[2], "\r\n"))))
++        {
++            msg(msglevel, "wss-proxy-header: invalid header or too many headers");
++            goto err;
++        }
++        int index = options->wss_header_count++;
++        options->wss_header_name[index] = p[1];
++        options->wss_header_value[index] = p[2] ? p[2] : "";
++    }
++#endif
++#if OBFS_ENABLE_UDP
++    else if (streq(p[0], "obfuscate-udp") && p[1] && p[2] && !p[3])
++    {
++        VERIFY_PERMISSION(OPT_P_GENERAL);
++        if (strlen(p[1]) != OBFS_UDP_KEY_HEX_LEN)
++        {
++            msg(msglevel, "obfuscate-udp: key must be exactly %d hex characters",
++                OBFS_UDP_KEY_HEX_LEN);
++            goto err;
++        }
++        for (const char *h = p[1]; *h; ++h)
++        {
++            if (!isxdigit((unsigned char)*h))
++            {
++                msg(msglevel, "obfuscate-udp: key must be hexadecimal");
++                goto err;
++            }
++        }
++        if (!atoi_constrained(p[2], &options->obfs_udp_padding, p[0], 0, OBFS_UDP_MAX_PADDING,
++                              msglevel))
++        {
++            goto err;
++        }
++        options->obfs_udp_key = p[1];
++    }
++#endif
+     else if (streq(p[0], "port") && p[1] && !p[2])
+     {
+         VERIFY_PERMISSION(OPT_P_GENERAL | OPT_P_CONNECTION);
+diff --git a/src/openvpn/options.h b/src/openvpn/options.h
+index 852144d..b56c54f 100644
+--- a/src/openvpn/options.h
++++ b/src/openvpn/options.h
+@@ -333,6 +333,21 @@ struct options
+     bool ifconfig_nowarn;
+     int shaper;
+ 
++    /* UDP obfuscation (--obfuscate-udp <key> <padding>) */
++    const char *obfs_udp_key;
++    int obfs_udp_padding;
++
++    /* Client-side transports. Keys are never logged. */
++    const char *obfs_tcp_key;
++    const char *wss_host;
++    const char *wss_uri;
++    const char *wss_sni;
++    bool wss_sni_enabled;
++    bool wss_allow_self_signed;
++    int wss_header_count;
++    const char *wss_header_name[20];
++    const char *wss_header_value[20];
++
+     int proto_force;
+ 
+     bool mtu_test;
+diff --git a/src/openvpn/socket.c b/src/openvpn/socket.c
+index d5a2c2d..4c555f4 100644
+--- a/src/openvpn/socket.c
++++ b/src/openvpn/socket.c
+@@ -22,6 +22,7 @@
+ 
+ #ifdef HAVE_CONFIG_H
+ #include "config.h"
++#include "obfs_features.h"
+ #endif
+ 
+ #include "syshead.h"
+@@ -29,6 +30,12 @@
+ #include "socket.h"
+ #include "fdmisc.h"
+ #include "misc.h"
++#if OBFS_ENABLE_UDP
++#include "obfs_udp.h"
++#endif
++#if OBFS_ENABLE_TCP
++#include <openssl/rand.h>
++#endif
+ #include "gremlin.h"
+ #include "plugin.h"
+ #include "ps.h"
+@@ -46,7 +53,12 @@ sockets_read_residual(const struct context *c)
+ {
+     for (int i = 0; i < c->c1.link_sockets_num; i++)
+     {
++#if OBFS_ENABLE_WSS
++        if ((c->c2.link_sockets[i]->wss && obfs_wss_pending(c->c2.link_sockets[i]))
++            || c->c2.link_sockets[i]->stream_buf.residual_fully_formed)
++#else
+         if (c->c2.link_sockets[i]->stream_buf.residual_fully_formed)
++#endif
+         {
+             return true;
+         }
+@@ -1391,6 +1403,47 @@ link_socket_init_phase1(struct context *c, int sock_index, int mode)
+     sock->info.plugins = c->plugins;
+     sock->server_poll_timeout = &c->c2.server_poll_interval;
+ 
++    if ((o->obfs_tcp_key || o->wss_host) && proto != PROTO_TCP_CLIENT)
++    {
++        msg(M_FATAL, "obfuscate and wss-proxy require proto tcp-client");
++    }
++    if (o->obfs_tcp_key && o->obfs_udp_key)
++    {
++        msg(M_FATAL, "obfuscate and obfuscate-udp cannot be combined");
++    }
++#if OBFS_ENABLE_UDP
++    if (o->obfs_udp_key && proto != PROTO_UDP)
++    {
++        msg(M_FATAL, "obfuscate-udp requires proto udp");
++    }
++#endif
++#if OBFS_ENABLE_WSS
++    if (!o->wss_host && (o->wss_sni_enabled || o->wss_allow_self_signed || o->wss_header_count))
++    {
++        msg(M_FATAL, "wss-proxy is required for the other WSS options");
++    }
++#endif
++#if OBFS_ENABLE_TCP
++    if (o->obfs_tcp_key)
++    {
++        sock->obfs_tcp = obfs_tcp_new(o->obfs_tcp_key);
++        if (!sock->obfs_tcp)
++        {
++            msg(M_FATAL, "OBFS TCP: cannot create scrambler");
++        }
++    }
++#endif
++#if OBFS_ENABLE_WSS
++    if (o->wss_host)
++    {
++        sock->wss = obfs_wss_new(o);
++        if (!sock->wss)
++        {
++            msg(M_FATAL, "WSS: cannot create TLS transport");
++        }
++    }
++#endif
++
+     sock->mode = mode;
+     if (mode == LS_MODE_TCP_ACCEPT_FROM)
+     {
+@@ -1684,6 +1737,7 @@ link_socket_init_phase2(struct context *c, struct link_socket *sock)
+ 
+     /* initialize buffers */
+     socket_frame_init(frame, sock);
++    sock->stream_buf.obfs_length = sock->obfs_tcp != NULL;
+ 
+     /* Second chance to resolv/create socket */
+     resolve_remote(sock, 2, sig_info);
+@@ -1757,6 +1811,13 @@ link_socket_init_phase2(struct context *c, struct link_socket *sock)
+         goto done;
+     }
+ 
++#if OBFS_ENABLE_WSS
++    if (sock->wss && !obfs_wss_connect(sock, sig_info))
++    {
++        register_signal(sig_info, SIGUSR1, "wss-connect-failed");
++        goto done;
++    }
++#endif
+     phase2_set_socket_flags(sock);
+     linksock_print_addr(sock);
+ 
+@@ -1822,6 +1883,15 @@ link_socket_close(struct link_socket *sock)
+         free_buf(&sock->stream_buf_data);
+         if (!gremlin)
+         {
++#if OBFS_ENABLE_UDP
++            obfs_udp_free(sock->obfs);
++#endif
++#if OBFS_ENABLE_TCP
++            obfs_tcp_free(sock->obfs_tcp);
++#endif
++#if OBFS_ENABLE_WSS
++            obfs_wss_free(sock->wss);
++#endif
+             free(sock);
+         }
+     }
+@@ -2175,6 +2245,12 @@ stream_buf_added(struct stream_buf *sb, int length_added)
+ 
+         ASSERT(buf_read(&sb->buf, &net_size, sizeof(net_size)));
+         sb->len = ntohps(net_size);
++#if OBFS_ENABLE_TCP
++        if (sb->obfs_length)
++        {
++            sb->len = obfs_tcp_length_decode(sb->len, sb->maxlen);
++        }
++#endif
+ 
+         if (sb->len < 1 || sb->len > sb->maxlen)
+         {
+@@ -2252,6 +2328,12 @@ bad_address_length(int actual, int expected)
+ int
+ link_socket_read_tcp(struct link_socket *sock, struct buffer *buf)
+ {
++#if OBFS_ENABLE_WSS
++    if (sock->wss)
++    {
++        return obfs_wss_read(sock, buf);
++    }
++#endif
+     int len = 0;
+ 
+     if (!sock->stream_buf.residual_fully_formed)
+@@ -2421,9 +2503,27 @@ link_socket_read_udp_posix(struct link_socket *sock, struct buffer *buf,
+ ssize_t
+ link_socket_write_tcp(struct link_socket *sock, struct buffer *buf, struct link_socket_actual *to)
+ {
++#if OBFS_ENABLE_WSS
++    if (sock->wss)
++    {
++        return obfs_wss_write(sock, buf, 2);
++    }
++#endif
+     packet_size_type len = BLEN(buf);
+     dmsg(D_STREAM_DEBUG, "STREAM: WRITE %d offset=%d", (int)len, buf->offset);
+     ASSERT(len <= sock->stream_buf.maxlen);
++#if OBFS_ENABLE_TCP
++    if (obfs_tcp_active(sock->obfs_tcp))
++    {
++        uint8_t random;
++        if (RAND_bytes(&random, 1) != 1)
++        {
++            sock->stream_reset = true;
++            return -1;
++        }
++        len = (packet_size_type)obfs_tcp_length_encode(len, random % 7);
++    }
++#endif
+     len = htonps(len);
+     ASSERT(buf_write_prepend(buf, &len, sizeof(len)));
+ #ifdef _WIN32
+@@ -2542,7 +2642,11 @@ socket_recv_queue(struct link_socket *sock, int maxsize)
+         int status;
+ 
+         /* reset buf to its initial state */
++#if OBFS_ENABLE_WSS
++        if (proto_is_udp(sock->info.proto) || sock->wss)
++#else
+         if (proto_is_udp(sock->info.proto))
++#endif
+         {
+             sock->reads.buf = sock->reads.buf_init;
+         }
+@@ -2924,6 +3028,20 @@ socket_set(struct link_socket *s, struct event_set *es, unsigned int rwflags, vo
+             rwflags &= ~EVENT_READ;
+         }
+ 
++#if OBFS_ENABLE_WSS
++        if (s->wss && obfs_wss_wants_write(s))
++        {
++#ifdef _WIN32
++            /* Start overlapped I/O even when only TLS control output is pending. */
++            obfs_wss_flush(s);
++#endif
++            if (obfs_wss_wants_write(s))
++            {
++                rwflags |= EVENT_WRITE;
++            }
++        }
++#endif
++
+ #ifdef _WIN32
+         if (rwflags & EVENT_READ)
+         {
+diff --git a/src/openvpn/socket.h b/src/openvpn/socket.h
+index ea0e6e7..08b062e 100644
+--- a/src/openvpn/socket.h
++++ b/src/openvpn/socket.h
+@@ -23,6 +23,7 @@
+ #ifndef SOCKET_H
+ #define SOCKET_H
+ 
++#include "obfs_features.h"
+ #include "buffer.h"
+ #include "common.h"
+ #include "error.h"
+@@ -35,6 +36,12 @@
+ #include "misc.h"
+ #include "tun.h"
+ #include "socket_util.h"
++#if OBFS_ENABLE_TCP
++#include "obfs_tcp.h"
++#endif
++#if OBFS_ENABLE_WSS
++#include "wss_client.h"
++#endif
+ 
+ /*
+  * OpenVPN's default port number as assigned by IANA.
+@@ -130,6 +137,7 @@ struct stream_buf
+     /** if true, a fatal TCP error has occurred,
+      *  requiring that connection be restarted */
+     bool error;
++    bool obfs_length;
+ #if PORT_SHARE
+ #define PS_DISABLED 0
+ #define PS_ENABLED  1
+@@ -162,10 +170,23 @@ void socket_set_buffers(socket_descriptor_t fd, const struct socket_buffer_size
+  * defines try to abstract away our implementation differences between
+  * using sockets on Posix vs. Win32.
+  */
++/* Forward declaration; defined in obfs_udp.h. */
++struct obfs_udp;
++struct obfs_tcp;
++struct wss_client;
++
+ struct link_socket
+ {
+     struct link_socket_info info;
+ 
++    /* UDP obfuscation (--obfuscate-udp); lazily initialized on first packet.
++     * The same link_socket is shared by all instances in server mode, so one
++     * context covers both the read and the per-instance write path. */
++    struct obfs_udp *obfs;
++    bool obfs_init_done;
++    struct obfs_tcp *obfs_tcp;
++    struct wss_client *wss;
++
+     struct event_arg ev_arg; /**< this struct will store a pointer to either mi or
+                               * link_socket, depending on the event type, to keep
+                               * it accessible it's placed within the same struct
+@@ -559,6 +580,12 @@ bool stream_buf_read_setup_dowork(struct stream_buf *sb);
+ static inline bool
+ stream_buf_read_setup(struct link_socket *sock)
+ {
++#if OBFS_ENABLE_WSS
++    if (sock->wss)
++    {
++        return !obfs_wss_pending(sock);
++    }
++#endif
+     if (link_socket_connection_oriented(sock))
+     {
+         return stream_buf_read_setup_dowork(&sock->stream_buf);
+diff --git a/tests/unit_tests/openvpn/Makefile.am b/tests/unit_tests/openvpn/Makefile.am
+index 8ec5cfd..3765fb3 100644
+--- a/tests/unit_tests/openvpn/Makefile.am
++++ b/tests/unit_tests/openvpn/Makefile.am
+@@ -45,6 +45,33 @@ TESTS = $(test_binaries)
+ endif
+ check_PROGRAMS = $(test_binaries)
+ 
++if HAVE_OBFS_UDP
++test_binaries += obfs_udp_testdriver
++obfs_udp_testdriver_CFLAGS = -I$(top_srcdir)/src/openvpn -I$(top_srcdir)/src/compat @TEST_CFLAGS@
++obfs_udp_testdriver_LDFLAGS = @TEST_LDFLAGS@
++obfs_udp_testdriver_SOURCES = mock_msg.c mock_msg.h test_common.h mock_get_random.c $(top_srcdir)/src/openvpn/buffer.c $(top_srcdir)/src/openvpn/platform.c $(top_srcdir)/src/openvpn/win32-util.c
++nodist_obfs_udp_testdriver_SOURCES = test_obfs_udp.c $(top_srcdir)/src/openvpn/obfs_udp.c
++EXTRA_DIST += test_obfs_udp.c
++endif
++
++if HAVE_OBFS_TCP
++test_binaries += obfs_tcp_testdriver
++obfs_tcp_testdriver_CFLAGS = -I$(top_srcdir)/src/openvpn -I$(top_srcdir)/src/compat @TEST_CFLAGS@
++obfs_tcp_testdriver_LDFLAGS = @TEST_LDFLAGS@
++obfs_tcp_testdriver_SOURCES = mock_msg.c mock_msg.h test_common.h mock_get_random.c $(top_srcdir)/src/openvpn/buffer.c $(top_srcdir)/src/openvpn/platform.c $(top_srcdir)/src/openvpn/win32-util.c
++nodist_obfs_tcp_testdriver_SOURCES = test_obfs_tcp.c $(top_srcdir)/src/openvpn/obfs_tcp.c
++EXTRA_DIST += test_obfs_tcp.c
++endif
++
++if HAVE_OBFS_WSS
++test_binaries += obfs_wss_testdriver
++obfs_wss_testdriver_CFLAGS = -I$(top_srcdir)/src/openvpn -I$(top_srcdir)/src/compat @TEST_CFLAGS@
++obfs_wss_testdriver_LDFLAGS = @TEST_LDFLAGS@
++obfs_wss_testdriver_SOURCES = mock_msg.c mock_msg.h test_common.h mock_get_random.c $(top_srcdir)/src/openvpn/buffer.c $(top_srcdir)/src/openvpn/platform.c $(top_srcdir)/src/openvpn/win32-util.c
++nodist_obfs_wss_testdriver_SOURCES = test_obfs_wss.c $(top_srcdir)/src/openvpn/wss_frame.c
++EXTRA_DIST += test_obfs_wss.c
++endif
++
+ if HAVE_SITNL
+ check_PROGRAMS += networking_testdriver
+ endif

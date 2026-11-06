@@ -1,0 +1,26 @@
+# Local editor settings and build output.
+.idea/
+.vscode/
+build/
+out/
+*.exe
+*.dll
+*.o
+*.obj
+
+# Local connection profiles, credentials and logs.
+*.ovpn
+!example.ovpn
+certs/
+runtime/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+*.log
+auth.txt
+credentials.txt
+
+.DS_Store
+Thumbs.db
